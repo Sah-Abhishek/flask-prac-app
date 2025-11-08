@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+
 from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
@@ -10,6 +12,8 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = 'your-secret-key-here'
 
 db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
 
 # Models
 class User(db.Model):
@@ -17,6 +21,8 @@ class User(db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(200), nullable=False)
     user_type = db.Column(db.String(20), nullable=False)  # distributor, shg, pharmacist
+    pincode = db.Column(db.String(10), nullable=False)
+    mobile_number = db.Column(db.String(15), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def set_password(self, password):
@@ -24,6 +30,40 @@ class User(db.Model):
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
+class StockRequest(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    
+    # Foreign keys
+    distributor_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    requester_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'))
+    
+    # Request details
+    name = db.Column(db.String(100), nullable=False)
+    pincode = db.Column(db.String(10), nullable=False)
+    mobile = db.Column(db.String(15), nullable=False)
+    quantity = db.Column(db.Integer)
+    
+    # Status tracking
+    status = db.Column(db.String(20), default='pending')  # pending, responded, rejected
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    responded_at = db.Column(db.DateTime)
+    
+    # Relationships
+    distributor = db.relationship(
+        'User',
+        foreign_keys=[distributor_id],
+        backref=db.backref('stock_requests_received', lazy='dynamic')
+    )
+    requester = db.relationship(
+        'User',
+        foreign_keys=[requester_id],
+        backref=db.backref('stock_requests_made', lazy='dynamic')
+    )
+    product = db.relationship('Product', backref='stock_requests')
+
+    def __repr__(self):
+        return f"<StockRequest id={self.id} status={self.status} distributor_id={self.distributor_id} requester_id={self.requester_id}>"
 
 class Product(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -83,53 +123,144 @@ with app.app_context():
 
 # Routes
 
+
+@app.route('/api/requests', methods=['POST'])
+def create_stock_request():
+    data = request.json
+
+    # Validate required fields
+    required_fields = ['distributor_id', 'requester_id', 'name', 'pincode', 'mobile']
+    missing_fields = [field for field in required_fields if not data.get(field)]
+    if missing_fields:
+        return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
+
+    # Fetch users
+    distributor = User.query.get_or_404(data['distributor_id'])
+    requester = User.query.get_or_404(data['requester_id'])
+
+    # Validate user types
+    if distributor.user_type != 'distributor':
+        return jsonify({'error': 'Invalid distributor'}), 400
+    if requester.user_type not in ['shg', 'pharmacist']:
+        return jsonify({'error': 'Requester must be SHG or Pharmacist'}), 400
+
+    # Create the stock request
+    request_entry = StockRequest(
+        distributor_id=data['distributor_id'],
+        requester_id=data['requester_id'],
+        name=data['name'],
+        pincode=data['pincode'],
+        mobile=data['mobile'],
+        status='pending'
+    )
+
+    db.session.add(request_entry)
+    db.session.commit()
+
+    return jsonify({
+        'id': request_entry.id,
+        'distributor_id': request_entry.distributor_id,
+        'requester_id': request_entry.requester_id,
+        'status': request_entry.status,
+        'created_at': request_entry.created_at.isoformat()
+    }), 201
+
+@app.route('/api/distributor/<int:distributor_id>/requests', methods=['GET'])
+def get_distributor_requests(distributor_id):
+    distributor = User.query.get_or_404(distributor_id)
+    if distributor.user_type != 'distributor':
+        return jsonify({'error': 'User is not a distributor'}), 400
+    
+    requests = StockRequest.query.filter_by(distributor_id=distributor_id).order_by(StockRequest.created_at.desc()).all()
+    return jsonify([{
+        'id': r.id,
+        'requester_id': r.requester_id,
+        'requester_name': r.requester.username,
+        'requester_type': r.requester.user_type,
+        'name': r.name,
+        'pincode': r.pincode,
+        'mobile': r.mobile,
+        'status': r.status,
+        'created_at': r.created_at.isoformat()
+    } for r in requests])
+
+@app.route('/api/requests/<int:request_id>/respond', methods=['POST'])
+def respond_to_request(request_id):
+    data = request.json
+    if not all(k in data for k in ['product_id', 'quantity']):
+        return jsonify({'error': 'Missing required fields'}), 400
+    
+    request_entry = StockRequest.query.get_or_404(request_id)
+    if request_entry.status != 'pending':
+        return jsonify({'error': 'Request already responded to'}), 400
+    
+    product = Product.query.get_or_404(data['product_id'])
+    distributor_id = request_entry.distributor_id
+    requester_id = request_entry.requester_id
+    quantity = int(data['quantity'])
+
+    # Create an order
+    order = Order(
+        distributor_id=distributor_id,
+        orderer_id=requester_id,
+        product_id=product.id,
+        quantity=quantity,
+        status='placed'
+    )
+    db.session.add(order)
+
+    # Update request status
+    request_entry.status = 'responded'
+    request_entry.responded_at = datetime.utcnow()
+
+    db.session.commit()
+
+    return jsonify({
+        'request_id': request_entry.id,
+        'status': request_entry.status,
+        'responded_at': request_entry.responded_at.isoformat(),
+        'order_id': order.id
+    }), 200
+
+
 # User Management
 @app.route('/api/users', methods=['POST'])
 def create_user():
     data = request.json
-    if not data.get('username') or not data.get('password') or not data.get('user_type'):
-        return jsonify({'error': 'Missing required fields'}), 400
-    
+
+    # Validate required fields
+    required_fields = ['username', 'password', 'user_type', 'pincode', 'mobile_number']
+    missing_fields = [field for field in required_fields if not data.get(field)]
+    if missing_fields:
+        return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
+
+    # Validate user type
     if data['user_type'] not in ['distributor', 'shg', 'pharmacist']:
         return jsonify({'error': 'Invalid user type'}), 400
-    
+
+    # Check for duplicate username
     if User.query.filter_by(username=data['username']).first():
         return jsonify({'error': 'Username already exists'}), 400
-    
-    user = User(username=data['username'], user_type=data['user_type'])
+
+    # Create new user
+    user = User(
+        username=data['username'],
+        user_type=data['user_type'],
+        pincode=data['pincode'],
+        mobile_number=data['mobile_number']
+    )
     user.set_password(data['password'])
+
     db.session.add(user)
     db.session.commit()
-    
+
     return jsonify({
         'id': user.id,
         'username': user.username,
-        'user_type': user.user_type
+        'user_type': user.user_type,
+        'pincode': user.pincode,
+        'mobile_number': user.mobile_number
     }), 201
-
-@app.route('/api/distributor/<int:distributor_id>/orders', methods=['GET'])
-def get_distributor_orders(distributor_id):
-    status = request.args.get('status')
-
-    query = Order.query.filter_by(distributor_id=distributor_id)
-    if status:
-        query = query.filter_by(status=status)
-
-    orders = query.all()
-    result = []
-    for order in orders:
-        result.append({
-            "id": order.id,
-            "orderer_id": order.orderer_id,
-            "product_id": order.product_id,
-            "product_name": order.product.name,
-            "quantity": order.quantity,
-            "status": order.status,
-            "created_at": order.created_at
-        })
-
-    return jsonify(result), 200
-
 
 # Update order status
 
