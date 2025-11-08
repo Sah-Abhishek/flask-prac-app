@@ -68,14 +68,15 @@ class Order(db.Model):
     orderer_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     product_id = db.Column(db.Integer, db.ForeignKey('product.id'), nullable=False)
     quantity = db.Column(db.Integer, nullable=False)
-    status = db.Column(db.String(20), default='placed')  # placed, delivered
+    status = db.Column(db.String(20), default='placed')  # placed, accepted, dispatched, delivered
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    accepted_at = db.Column(db.DateTime)
+    dispatched_at = db.Column(db.DateTime)
     delivered_at = db.Column(db.DateTime)
-    
+
     distributor = db.relationship('User', foreign_keys=[distributor_id], backref='orders_received')
     orderer = db.relationship('User', foreign_keys=[orderer_id], backref='orders_placed')
     product = db.relationship('Product', backref='orders')
-
 # Initialize database
 with app.app_context():
     db.create_all()
@@ -105,6 +106,117 @@ def create_user():
         'username': user.username,
         'user_type': user.user_type
     }), 201
+
+@app.route('/api/distributor/<int:distributor_id>/orders', methods=['GET'])
+def get_distributor_orders(distributor_id):
+    status = request.args.get('status')
+
+    query = Order.query.filter_by(distributor_id=distributor_id)
+    if status:
+        query = query.filter_by(status=status)
+
+    orders = query.all()
+    result = []
+    for order in orders:
+        result.append({
+            "id": order.id,
+            "orderer_id": order.orderer_id,
+            "product_id": order.product_id,
+            "product_name": order.product.name,
+            "quantity": order.quantity,
+            "status": order.status,
+            "created_at": order.created_at
+        })
+
+    return jsonify(result), 200
+
+
+# Update order status
+
+@app.route('/api/orders/<int:order_id>/status', methods=['PUT'])
+def update_order_status(order_id):
+    data = request.json
+    new_status = data.get('status')
+    
+    valid_transitions = {
+        'placed': 'accepted',
+        'accepted': 'dispatched',
+        'dispatched': 'delivered'
+    }
+
+    if new_status not in ['accepted', 'dispatched', 'delivered']:
+        return jsonify({'error': 'Invalid status'}), 400
+
+    order = Order.query.get_or_404(order_id)
+    
+    # Ensure the user updating is the correct distributor
+    distributor_id = data.get('distributor_id')
+    if order.distributor_id != distributor_id:
+        return jsonify({'error': 'Unauthorized distributor'}), 403
+    
+    current_status = order.status
+    expected_next = valid_transitions.get(current_status)
+
+    if expected_next != new_status:
+        return jsonify({
+            'error': f'Invalid transition. You can only move from {current_status} → {expected_next}'
+        }), 400
+    
+    # --- Handle each transition ---
+    if new_status == 'accepted':
+        order.status = 'accepted'
+        order.accepted_at = datetime.utcnow()
+    
+    elif new_status == 'dispatched':
+        order.status = 'dispatched'
+        order.dispatched_at = datetime.utcnow()
+    
+    elif new_status == 'delivered':
+        order.status = 'delivered'
+        order.delivered_at = datetime.utcnow()
+
+        # Deduct distributor inventory + add to SHG/Pharmacist
+        distributor_inv = DistributorInventory.query.filter_by(
+            distributor_id=order.distributor_id,
+            product_id=order.product_id
+        ).first()
+        
+        if not distributor_inv or distributor_inv.quantity < order.quantity:
+            return jsonify({'error': 'Insufficient distributor inventory'}), 400
+        
+        distributor_inv.quantity -= order.quantity
+        orderer = order.orderer
+
+        if orderer.user_type == 'shg':
+            inv = SHGInventory.query.filter_by(
+                shg_id=order.orderer_id, product_id=order.product_id
+            ).first()
+            if inv: inv.quantity += order.quantity
+            else:
+                db.session.add(SHGInventory(
+                    shg_id=order.orderer_id, product_id=order.product_id, quantity=order.quantity
+                ))
+
+        elif orderer.user_type == 'pharmacist':
+            inv = PharmacistInventory.query.filter_by(
+                pharmacist_id=order.orderer_id, product_id=order.product_id
+            ).first()
+            if inv: inv.quantity += order.quantity
+            else:
+                db.session.add(PharmacistInventory(
+                    pharmacist_id=order.orderer_id, product_id=order.product_id, quantity=order.quantity
+                ))
+
+    db.session.commit()
+
+    return jsonify({
+        'id': order.id,
+        'status': order.status,
+        'accepted_at': order.accepted_at.isoformat() if order.accepted_at else None,
+        'dispatched_at': order.dispatched_at.isoformat() if order.dispatched_at else None,
+        'delivered_at': order.delivered_at.isoformat() if order.delivered_at else None
+    }), 200
+
 
 @app.route('/api/users', methods=['GET'])
 def get_users():
